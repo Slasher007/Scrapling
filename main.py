@@ -80,6 +80,18 @@ def extract_job_id(job_url: str, fallback: str = "") -> str:
     return jk or fallback or job_url
 
 
+def is_already_applied_text(text: str) -> bool:
+    text = text.lower()
+    indicators = (
+        "already applied",
+        "applied",
+        "postulé",
+        "déjà postulé",
+        "candidature déjà envoy",
+    )
+    return any(indicator in text for indicator in indicators)
+
+
 def extract_job_links(response, applied_jobs: set[str]) -> list[tuple[str, str]]:
     links: list[tuple[str, str]] = []
     seen_on_page: set[str] = set()
@@ -92,6 +104,9 @@ def extract_job_links(response, applied_jobs: set[str]) -> list[tuple[str, str]]
         job_url = normalize_job_url(href)
         data_jk = card.attrib.get("data-jk", "")
         job_id = extract_job_id(job_url, fallback=data_jk)
+        card_text = card.get_all_text(strip=True) or ""
+        if is_already_applied_text(card_text):
+            continue
         if job_id in applied_jobs or job_id in seen_on_page:
             continue
         seen_on_page.add(job_id)
@@ -103,12 +118,22 @@ def extract_job_links(response, applied_jobs: set[str]) -> list[tuple[str, str]]
 # ─────────────────────────────────────────────
 # CORE APPLICATION LOGIC
 # ─────────────────────────────────────────────
-async def attempt_easy_apply(session: AsyncStealthySession, job_url: str, job_id: str) -> bool:
+async def attempt_easy_apply(session: AsyncStealthySession, job_url: str, job_id: str) -> str:
     """
     Opens a job page and tries to click the Easy Apply button.
-    Returns True if application was submitted successfully.
+    Returns:
+      - "submitted" when an application is sent
+      - "already_applied" when job was already applied to
+      - "failed" when auto-apply was not completed
     """
+    state = {"already_applied": False}
+
     async def apply_action(page):
+        page_text = (await page.locator("body").first.inner_text()).lower()
+        if is_already_applied_text(page_text):
+            state["already_applied"] = True
+            return
+
         # Indeed uses several selectors depending on locale/version
         easy_apply_selectors = [
             "button:has-text('Candidature simplifiée')",
@@ -147,6 +172,10 @@ async def attempt_easy_apply(session: AsyncStealthySession, job_url: str, job_id
         )
 
         text = response.get_all_text().lower()
+        if state["already_applied"] or is_already_applied_text(text):
+            log.info(f"Already applied to job {job_id} — skipping.")
+            return "already_applied"
+
         success_indicators = (
             "application submitted",
             "candidature envoy",
@@ -156,13 +185,13 @@ async def attempt_easy_apply(session: AsyncStealthySession, job_url: str, job_id
 
         if submitted:
             log.info(f"Successfully applied to job {job_id}")
+            return "submitted"
         else:
             log.warning(f"Application modal could not be auto-completed for {job_id}")
-
-        return submitted
+            return "failed"
     except Exception as e:
         log.error(f"Error applying to {job_url}: {e}")
-        return False
+        return "failed"
 
 
 async def handle_application_modal(page) -> bool:
@@ -286,14 +315,16 @@ async def run_bot():
                     log.info(f"Rate-limit pause: {wait:.1f}s before next application...")
                     await asyncio.sleep(wait)
 
-                success = await attempt_easy_apply(session, job_url, job_id)
-                if success:
+                result = await attempt_easy_apply(session, job_url, job_id)
+                if result == "submitted":
                     save_applied_job(job_id, applied_jobs)
                     applications_this_session += 1
                     log.info(
                         f"Progress: {applications_this_session}/{CONFIG['max_applications_per_session']} "
                         f"applied this session"
                     )
+                elif result == "already_applied":
+                    save_applied_job(job_id, applied_jobs)
 
             page_num += 1
 
